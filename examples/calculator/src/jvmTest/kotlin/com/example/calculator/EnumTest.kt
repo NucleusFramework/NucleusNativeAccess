@@ -114,4 +114,61 @@ class EnumTest {
         }
     }
 
+    @Test
+    fun `one-line enum has correct entries`() {
+        assertEquals(listOf("RED", "GREEN", "BLUE"), Color.entries.map { it.name })
+        assertEquals(0, Color.RED.ordinal)
+        assertEquals(1, Color.GREEN.ordinal)
+        assertEquals(2, Color.BLUE.ordinal)
+    }
+
+    @Test
+    fun `enum with constructor - properties match`() {
+        assertEquals(listOf("SUCCESS", "ERROR", "PENDING"), Status.entries.map { it.name })
+        assertEquals(0, Status.SUCCESS.code)
+        assertEquals(1, Status.ERROR.code)
+        assertEquals(2, Status.PENDING.code)
+    }
+
+    @Test
+    fun `enum with constructor - as return value`() {
+        Calculator(10).use { calc ->
+            assertEquals(Status.SUCCESS, calc.getStatus())
+        }
+        Calculator(-5).use { calc ->
+            assertEquals(Status.ERROR, calc.getStatus())
+        }
+        Calculator(0).use { calc ->
+            assertEquals(Status.PENDING, calc.getStatus())
+        }
+    }
+
+    @Test
+    fun `enum with constructor - as mutable property`() {
+        Calculator(0).use { calc ->
+            assertEquals(Status.SUCCESS, calc.lastStatus)
+            calc.lastStatus = Status.PENDING
+            assertEquals(Status.PENDING, calc.lastStatus)
+        }
+    }
+
+    @Test
+    fun `enum with multi-param constructor - properties match`() {
+        assertEquals(2, HttpStatus.entries.size)
+        assertEquals(200, HttpStatus.OK.code)
+        assertEquals("OK", HttpStatus.OK.label)
+        assertEquals(404, HttpStatus.NOT_FOUND.code)
+        assertEquals("Not Found", HttpStatus.NOT_FOUND.label)
+    }
+
+    @Test
+    fun `enum with multi-param constructor - as return value`() {
+        Calculator(1).use { calc ->
+            assertEquals(HttpStatus.OK, calc.getHttpStatus())
+        }
+        Calculator(-1).use { calc ->
+            assertEquals(HttpStatus.NOT_FOUND, calc.getHttpStatus())
+        }
+    }
+
 }
