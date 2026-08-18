@@ -32,6 +32,9 @@ jobs:
           packages: libnotify-dev libglib2.0-dev libdbusmenu-glib-dev libpipewire-0.3-dev
           version: 1.0
 
+      - name: Plugin functional tests
+        run: ./gradlew -p plugin-build :nna:test
+
       - name: Build calculator (compile tests without running)
         run: ./gradlew :examples:calculator:jvmTestClasses :examples:calculator:compileKotlinLinuxX64
 

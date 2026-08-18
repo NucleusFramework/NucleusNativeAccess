@@ -8,6 +8,7 @@ dependencies {
     compileOnly(libs.kotlin.compiler.embeddable)
     compileOnly(libs.kotlin.gradle.plugin)
     testImplementation(libs.junit)
+    testImplementation(gradleTestKit())
 }
 
 kotlin {
@@ -15,6 +16,7 @@ kotlin {
 }
 
 gradlePlugin {
+    testSourceSets(sourceSets.test.get())
     plugins {
         create(property("ID").toString()) {
             id = property("ID").toString()
@@ -25,6 +27,11 @@ gradlePlugin {
             tags.set(listOf("kotlin", "native", "jvm", "ffm", "interop"))
         }
     }
+}
+
+tasks.test {
+    useJUnit()
+    systemProperty("nna.pluginBuildDir", rootProject.projectDir.absolutePath)
 }
 
 gradlePlugin {
