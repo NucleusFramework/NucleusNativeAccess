@@ -8,6 +8,7 @@ dependencies {
     compileOnly(libs.kotlin.compiler.embeddable)
     compileOnly(libs.kotlin.gradle.plugin)
     testImplementation(libs.junit)
+    testImplementation(libs.kotlin.compiler.embeddable)
 }
 
 kotlin {

@@ -4,6 +4,7 @@ import dev.nucleusframework.nna.plugin.ir.KneClass
 import dev.nucleusframework.nna.plugin.ir.KneConstructor
 import dev.nucleusframework.nna.plugin.ir.KneDataClass
 import dev.nucleusframework.nna.plugin.ir.KneEnum
+import dev.nucleusframework.nna.plugin.ir.KneEnumEntry
 import dev.nucleusframework.nna.plugin.ir.KneFunction
 import dev.nucleusframework.nna.plugin.ir.KneInterface
 import dev.nucleusframework.nna.plugin.ir.KneModule
@@ -25,6 +26,7 @@ import org.jetbrains.kotlin.psi.KtNullableType
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
 import org.jetbrains.kotlin.psi.KtProperty
 import org.jetbrains.kotlin.psi.KtPsiFactory
+import org.jetbrains.kotlin.psi.KtSuperTypeCallEntry
 import org.jetbrains.kotlin.psi.KtTypeElement
 import org.jetbrains.kotlin.psi.KtTypeReference
 import org.jetbrains.kotlin.psi.KtUserType
@@ -138,7 +140,7 @@ class PsiSourceParser {
                     for (decl in declarations) {
                         if (decl.isPrivateOrInternal()) continue
                         when {
-                            decl is KtClass && decl.isEnum() -> parseEnum(decl, pkg)?.let { enumMap.putIfAbsent(it.fqName, it) }
+                            decl is KtClass && decl.isEnum() -> parseEnum(decl, pkg, typeMaps)?.let { enumMap.putIfAbsent(it.fqName, it) }
                             decl is KtClass && decl.isData() -> {
                                 val name = decl.name ?: continue
                                 val dcInfo = knownDataClasses[name] ?: continue
@@ -337,11 +339,40 @@ class PsiSourceParser {
         return KneInterface(name, fq, methods, properties, superInterfaces, isCommon = isCommon)
     }
 
-    private fun parseEnum(ktClass: KtClass, pkg: String): KneEnum? {
+    private fun parseEnum(ktClass: KtClass, pkg: String, typeMaps: TypeMaps): KneEnum? {
         val name = ktClass.name ?: return null
         val fq = if (pkg.isNotEmpty()) "$pkg.$name" else name
-        return KneEnum(name, fq, ktClass.declarations.filterIsInstance<KtEnumEntry>().mapNotNull { it.name })
+
+        // `declarations` can omit enum entries depending on PSI (stubs vs. AST).
+        // Raw body children always include KtEnumEntry nodes created by the parser.
+        val psiEntries = ktClass.body?.children?.filterIsInstance<KtEnumEntry>().orEmpty().ifEmpty {
+            ktClass.declarations.filterIsInstance<KtEnumEntry>()
+        }
+        val entries = parseEnumEntries(psiEntries)
+
+        val rawCtorParams = ktClass.primaryConstructor?.valueParameters ?: emptyList()
+        val ctorParams = rawCtorParams.map { param ->
+            val pName = param.name ?: return KneEnum(name, fq, entries)
+            val type = resolveTypeFromMaps(param.typeReference, typeMaps)
+                ?: return KneEnum(name, fq, entries)
+            KneParam(pName, type, hasDefault = param.hasDefaultValue())
+        }
+
+        return KneEnum(name, fq, entries, ctorParams)
     }
+
+    private fun parseEnumEntries(psiEntries: List<KtEnumEntry>): List<KneEnumEntry> =
+        psiEntries.mapNotNull { entry ->
+            val entryName = entry.name ?: return@mapNotNull null
+            val args = entry.superTypeListEntries
+                .filterIsInstance<KtSuperTypeCallEntry>()
+                .firstOrNull()
+                ?.valueArgumentList
+                ?.arguments
+                ?.map { it.getArgumentExpression()?.text ?: return@mapNotNull null }
+                ?: emptyList()
+            KneEnumEntry(entryName, args)
+        }
 
     private fun parseFunction(fn: KtNamedFunction, typeMaps: TypeMaps): KneFunction? {
         val name = fn.name ?: return null
