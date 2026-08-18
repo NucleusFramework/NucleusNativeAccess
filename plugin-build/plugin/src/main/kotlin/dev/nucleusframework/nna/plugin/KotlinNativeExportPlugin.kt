@@ -4,8 +4,6 @@ import dev.nucleusframework.nna.plugin.tasks.GenerateNativeBridgesTask
 import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
-import org.gradle.api.artifacts.VersionCatalog
-import org.gradle.api.artifacts.VersionCatalogsExtension
 import org.gradle.api.logging.LogLevel
 import org.gradle.api.tasks.testing.Test
 import org.gradle.kotlin.dsl.*
@@ -15,7 +13,6 @@ import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 import org.jetbrains.kotlin.gradle.plugin.mpp.NativeBuildType
 import org.jetbrains.kotlin.gradle.targets.jvm.KotlinJvmTarget
 import java.io.File
-import kotlin.jvm.optionals.getOrNull
 
 /**
  * Main entry point for the kotlin-native-export Gradle plugin.
@@ -127,9 +124,10 @@ class KotlinNativeExportPlugin : Plugin<Project> {
         // Keep old task name as alias
         project.tasks.register("generateKneJvmProxies") { dependsOn(generateBridges) }
 
-        // read the kotlinx coroutines version from the catalog otherwise fallback to some version
-        val coroutinesVersion = project.versionCatalog
-            ?.findVersion("kotlinx-coroutines")?.getOrNull()?.toString() ?: "1.11.0"
+        // Required for generated suspend/Flow bridges. Always added by Maven
+        // coordinates — never look up the consumer's version catalog. Alias
+        // names in libs.versions.toml are project-local and must not be required.
+        val coroutinesVersion = DEFAULT_COROUTINES_VERSION
 
         nativeTarget?.let { target ->
             kotlin.sourceSets.findByName("${target.name}Main")?.dependencies {
@@ -294,9 +292,7 @@ class KotlinNativeExportPlugin : Plugin<Project> {
         }
     }
 
-    private val Project.versionCatalog: VersionCatalog?
-        get() {
-            val catalogs = project.extensions.getByType<VersionCatalogsExtension>()
-            return catalogs.find("libs").getOrNull()
-        }
+    companion object {
+        private const val DEFAULT_COROUTINES_VERSION = "1.11.0"
+    }
 }
