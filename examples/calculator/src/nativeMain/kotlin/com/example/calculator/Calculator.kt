@@ -83,6 +83,16 @@ class Calculator(initial: Int = 0) {
 
     fun getLastOp(): Operation = lastOperation
 
+    var lastStatus: Status = Status.SUCCESS
+
+    fun getStatus(): Status = when {
+        accumulator > 0 -> Status.SUCCESS
+        accumulator < 0 -> Status.ERROR
+        else -> Status.PENDING
+    }
+
+    fun getHttpStatus(): HttpStatus = if (accumulator >= 0) HttpStatus.OK else HttpStatus.NOT_FOUND
+
     // ── Nullable types ──────────────────────────────────────────────────────
 
     var nickname: String? = null

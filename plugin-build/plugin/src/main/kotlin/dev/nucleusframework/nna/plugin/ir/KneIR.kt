@@ -45,10 +45,16 @@ data class KneClass(
     val isCommon: Boolean = false,
 ) : Serializable
 
+data class KneEnumEntry(
+    val name: String,
+    val constructorArgs: List<String> = emptyList(),
+) : Serializable
+
 data class KneEnum(
     val simpleName: String,
     val fqName: String,
-    val entries: List<String>,
+    val entries: List<KneEnumEntry>,
+    val constructorParams: List<KneParam> = emptyList(),
 ) : Serializable
 
 data class KneConstructor(
