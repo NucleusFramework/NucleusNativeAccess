@@ -4,7 +4,7 @@ pluginManagement {
     plugins {
         // Pin KMP version here so sub-projects don't need to re-declare it
         // (avoids "already on classpath with unknown version" from the composite build)
-        kotlin("multiplatform") version "2.3.20"
+        kotlin("multiplatform") version "2.4.20"
     }
     repositories {
         gradlePluginPortal()
@@ -21,6 +21,7 @@ dependencyResolutionManagement {
 
 plugins {
     id("com.gradle.develocity") version "4.4.0"
+    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
 }
 
 develocity {

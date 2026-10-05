@@ -2,6 +2,7 @@ package com.example.calculator
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.test.assertNotEquals
 import java.lang.Math.PI
@@ -583,13 +584,13 @@ class InheritanceTest {
 
     @Test fun `Circle is not Rectangle`() {
         Circle(2.0).use { circle ->
-            assertTrue(circle !is Rectangle)
+            assertFalse(Rectangle::class.isInstance(circle))
         }
     }
 
     @Test fun `Cube is not Cylinder`() {
         Cube(2.0).use { cube ->
-            assertTrue(cube !is Cylinder)
+            assertFalse(Cylinder::class.isInstance(cube))
         }
     }
 

@@ -2,8 +2,9 @@ import io.github.kdroidfilter.nucleus.desktop.application.dsl.TargetFormat
 
 plugins {
     kotlin("multiplatform")
-    id("org.jetbrains.compose") version "1.10.2"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.3.20"
+    id("org.jetbrains.compose") version "1.12.1"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.4.20"
+    id("org.jetbrains.compose.hot-reload") version "1.3.0-beta01"
     id("io.github.kdroidfilter.nucleus") version "1.7.2"
     id("dev.nucleusframework.nna")
 }
@@ -23,14 +24,14 @@ kotlin {
     jvm()
 
     sourceSets {
-        val jvmMain by getting {
+        jvmMain {
             dependencies {
                 implementation(compose.desktop.currentOs)
-                implementation(compose.runtime)
+                implementation("org.jetbrains.compose.runtime:runtime:1.12.1")
                 implementation("io.github.kdroidfilter:nucleus.graalvm-runtime:1.7.2")
             }
         }
-        val jvmTest by getting {
+        jvmTest {
             dependencies {
                 implementation(kotlin("test"))
                 implementation(kotlin("test-junit5"))
