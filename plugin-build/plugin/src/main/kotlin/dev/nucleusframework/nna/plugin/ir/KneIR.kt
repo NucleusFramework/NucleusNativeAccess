@@ -96,26 +96,41 @@ data class KneParam(
 ) : Serializable
 
 sealed class KneType : Serializable {
-    object INT : KneType()
-    object LONG : KneType()
-    object DOUBLE : KneType()
-    object FLOAT : KneType()
-    object BOOLEAN : KneType()
-    object BYTE : KneType()
-    object SHORT : KneType()
-    object STRING : KneType()
-    object UNIT : KneType()
+    data object INT : KneType()
+    data object LONG : KneType()
+    data object DOUBLE : KneType()
+    data object FLOAT : KneType()
+    data object BOOLEAN : KneType()
+    data object BYTE : KneType()
+    data object SHORT : KneType()
+    data object STRING : KneType()
+    data object UNIT : KneType()
     data class OBJECT(val fqName: String, val simpleName: String) : KneType()
     data class INTERFACE(val fqName: String, val simpleName: String) : KneType()
     data class ENUM(val fqName: String, val simpleName: String) : KneType()
     data class NULLABLE(val inner: KneType) : KneType()
     data class FUNCTION(val paramTypes: List<KneType>, val returnType: KneType) : KneType()
     data class DATA_CLASS(val fqName: String, val simpleName: String, val fields: List<KneParam>) : KneType()
-    object BYTE_ARRAY : KneType()
+    data object BYTE_ARRAY : KneType()
     data class LIST(val elementType: KneType) : KneType()
     data class SET(val elementType: KneType) : KneType()
     data class MAP(val keyType: KneType, val valueType: KneType) : KneType()
     data class FLOW(val elementType: KneType) : KneType()
+
+    /** Preserves singleton identity when deserialized from the incremental cache. */
+    protected fun readResolve(): Any = when (this) {
+        INT -> INT
+        LONG -> LONG
+        DOUBLE -> DOUBLE
+        FLOAT -> FLOAT
+        BOOLEAN -> BOOLEAN
+        BYTE -> BYTE
+        SHORT -> SHORT
+        STRING -> STRING
+        UNIT -> UNIT
+        BYTE_ARRAY -> BYTE_ARRAY
+        else -> this
+    }
 
     /** The FFM ValueLayout constant name for this type. */
     val ffmLayout: String
