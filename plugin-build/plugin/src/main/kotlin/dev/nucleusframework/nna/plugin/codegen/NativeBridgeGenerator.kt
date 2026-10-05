@@ -25,6 +25,11 @@ import dev.nucleusframework.nna.plugin.ir.KneType
  */
 class NativeBridgeGenerator {
 
+    companion object {
+        /** Elements a native flow may emit ahead of the JVM collector (credit-based backpressure). */
+        const val FLOW_INITIAL_CREDITS = 64
+    }
+
     /** Whether this type uses the output-buffer pattern for returns. */
     private fun KneType.returnsViaBuffer(): Boolean =
         this == KneType.STRING || this == KneType.BYTE_ARRAY ||
@@ -71,15 +76,57 @@ class NativeBridgeGenerator {
         }
         appendLine()
 
-        // Thread-safe error state using AtomicReference (works with new memory model + foreign threads)
-        appendLine("private val _kneLastError = AtomicReference<String?>(null)")
+        // Per-thread bridge state: each FFM downcall and its follow-up queries run on the same thread
+        appendLine("@kotlin.native.concurrent.ThreadLocal")
+        appendLine("private object _kneLastError { var value: String? = null }")
         appendLine()
+        appendLine("/** Id of a JVM callback exception parked by the upcall stub, 0 when none. */")
+        appendLine("@kotlin.native.concurrent.ThreadLocal")
+        appendLine("private object _kneCallbackError { var value: Long = 0L }")
+        appendLine()
+        appendLine("/** Collection result that did not fit the caller buffers, handed back via kne_takeOverflow. */")
+        appendLine("@kotlin.native.concurrent.ThreadLocal")
+        appendLine("private object _kneOverflow { var value: Any? = null }")
+        appendLine()
+        appendLine("/** Unwinds native code when a JVM callback threw; the message carries the parked exception id. */")
+        appendLine("private class KneCallbackException(id: Long) : RuntimeException(\"kne-callback-error:\$id\")")
+        appendLine()
+        appendLine("/** Writes a NUL-terminated string; if it does not fit, writes 0xFF + a StableRef handle the JVM reads back. */")
+        appendLine("private fun _kneWriteCString(value: String, out: CPointer<ByteVar>?, len: Int) {")
+        appendLine("    if (out == null) return")
+        appendLine("    val bytes = value.encodeToByteArray()")
+        appendLine("    if (bytes.size < len) {")
+        appendLine("        bytes.forEachIndexed { i, b -> out[i] = b }")
+        appendLine("        out[bytes.size] = 0")
+        appendLine("        return")
+        appendLine("    }")
+        appendLine("    val ref = StableRef.create(value).asCPointer().toLong().toString().encodeToByteArray()")
+        appendLine("    out[0] = 0xFF.toByte()")
+        appendLine("    ref.forEachIndexed { i, b -> out[i + 1] = b }")
+        appendLine("    out[ref.size + 1] = 0")
+        appendLine("}")
+        appendLine()
+        appendLine("private inline fun <T> _kneCallback(block: () -> T): T {")
+        appendLine("    val result = block()")
+        appendLine("    val id = _kneCallbackError.value")
+        appendLine("    if (id != 0L) {")
+        appendLine("        _kneCallbackError.value = 0L")
+        appendLine("        throw KneCallbackException(id)")
+        appendLine("    }")
+        appendLine("    return result")
+        appendLine("}")
+        appendLine()
+        if (hasFlow) {
+            appendLine("/** Flow job handle: cancellation plus credit-based backpressure driven by the JVM collector. */")
+            appendLine("private class KneFlowJob(val job: Job, val credits: kotlinx.coroutines.channels.Channel<Unit>)")
+            appendLine()
+        }
 
         appendErrorFunctions(module.libName)
 
         // Suspend/Flow helper bridges (once per module)
         if (hasSuspend || hasFlow) {
-            appendSuspendHelpers(module.libName)
+            appendSuspendHelpers(module.libName, hasFlow)
         }
 
         module.classes.filter { !it.isCommon }.forEach { cls -> appendClass(cls, module.libName) }
@@ -163,6 +210,49 @@ class NativeBridgeGenerator {
         appendLine("    bytes.forEachIndexed { i, b -> if (i < writeLen) outBuf?.set(i, b) }")
         appendLine("    outBuf?.set(writeLen, 0)")
         appendLine("    return bytes.size")
+        appendLine("}")
+        appendLine()
+        appendLine("@CName(\"${prefix}_kne_setCallbackError\")")
+        appendLine("fun `${prefix}_kne_setCallbackError`(id: Long) { _kneCallbackError.value = id }")
+        appendLine()
+        // Dispose a StableRef (for cleaning up result handles)
+        appendLine("@CName(\"${prefix}_kne_disposeRef\")")
+        appendLine("fun `${prefix}_kne_disposeRef`(handle: Long) {")
+        appendLine("    if (handle == 0L) return")
+        appendLine("    try { handle.toCPointer<COpaque>()?.asStableRef<Any>()?.dispose() } catch (_: Throwable) {}")
+        appendLine("}")
+        appendLine()
+
+        // Read a String from a StableRef handle
+        appendLine("@CName(\"${prefix}_kne_readStringRef\")")
+        appendLine("fun `${prefix}_kne_readStringRef`(handle: Long, outBuf: CPointer<ByteVar>?, outLen: Int): Int {")
+        appendLine("    val str = handle.toCPointer<COpaque>()!!.asStableRef<String>().get()")
+        appendLine("    val bytes = str.encodeToByteArray()")
+        appendLine("    val writeLen = minOf(bytes.size, outLen - 1)")
+        appendLine("    bytes.forEachIndexed { i, b -> if (i < writeLen) outBuf?.set(i, b) }")
+        appendLine("    outBuf?.set(writeLen, 0)")
+        appendLine("    return bytes.size")
+        appendLine("}")
+        appendLine()
+
+        // Read a ByteArray from a StableRef handle
+        appendLine("@CName(\"${prefix}_kne_readByteArrayRef\")")
+        appendLine("fun `${prefix}_kne_readByteArrayRef`(handle: Long, outBuf: CPointer<ByteVar>?, outLen: Int): Int {")
+        appendLine("    val bytes = when (val value = handle.toCPointer<COpaque>()!!.asStableRef<Any>().get()) {")
+        appendLine("        is String -> value.encodeToByteArray()")
+        appendLine("        else -> value as ByteArray")
+        appendLine("    }")
+        appendLine("    val writeLen = minOf(bytes.size, outLen)")
+        appendLine("    bytes.forEachIndexed { i, b -> if (i < writeLen) outBuf?.set(i, b) }")
+        appendLine("    return bytes.size")
+        appendLine("}")
+        appendLine()
+
+        appendLine("@CName(\"${prefix}_kne_takeOverflow\")")
+        appendLine("fun `${prefix}_kne_takeOverflow`(): Long {")
+        appendLine("    val value = _kneOverflow.value ?: return 0L")
+        appendLine("    _kneOverflow.value = null")
+        appendLine("    return StableRef.create(value).asCPointer().toLong()")
         appendLine("}")
         appendLine()
     }
@@ -438,12 +528,7 @@ class NativeBridgeGenerator {
             val outName = "${prefix}_${f.name}"
             val valueExpr = "$objExpr.${f.name}"
             when (f.type) {
-                KneType.STRING -> {
-                    appendLine("    val ${outName}_bytes = $valueExpr.encodeToByteArray()")
-                    appendLine("    val ${outName}_writeLen = minOf(${outName}_bytes.size, ${outName}_len - 1)")
-                    appendLine("    ${outName}_bytes.forEachIndexed { i, b -> if (i < ${outName}_writeLen) $outName?.set(i, b) }")
-                    appendLine("    $outName?.set(${outName}_writeLen, 0)")
-                }
+                KneType.STRING -> appendLine("    _kneWriteCString($valueExpr, $outName, ${outName}_len)")
                 KneType.BOOLEAN -> appendLine("    $outName!![0] = if ($valueExpr) 1 else 0")
                 is KneType.ENUM -> appendLine("    $outName!![0] = $valueExpr.ordinal")
                 is KneType.OBJECT -> appendLine("    $outName!![0] = StableRef.create($valueExpr).asCPointer().toLong()")
@@ -521,58 +606,39 @@ class NativeBridgeGenerator {
         }
     }
 
-    private fun StringBuilder.appendCollectionElementsReturn(listExpr: String, elemType: KneType) {
-        when (elemType) {
-            KneType.STRING -> {
-                appendLine("    var _offset = 0")
-                appendLine("    for (_s in $listExpr) {")
-                appendLine("        val _bytes = _s.encodeToByteArray()")
-                appendLine("        if (_offset + _bytes.size + 1 > outBufLen) break")
-                appendLine("        _bytes.forEachIndexed { i, b -> outBuf?.set(_offset + i, b) }")
-                appendLine("        outBuf?.set(_offset + _bytes.size, 0)")
-                appendLine("        _offset += _bytes.size + 1")
-                appendLine("    }")
-                appendLine("    return $listExpr.size")
-            }
-            KneType.BOOLEAN -> {
-                appendLine("    val _writeLen = minOf($listExpr.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = if ($listExpr[i]) 1 else 0")
-                appendLine("    return $listExpr.size")
-            }
-            is KneType.ENUM -> {
-                appendLine("    val _writeLen = minOf($listExpr.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = $listExpr[i].ordinal")
-                appendLine("    return $listExpr.size")
-            }
-            is KneType.OBJECT -> {
-                appendLine("    val _writeLen = minOf($listExpr.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = StableRef.create($listExpr[i]).asCPointer().toLong()")
-                appendLine("    return $listExpr.size")
-            }
-            KneType.BYTE_ARRAY -> {
-                // ByteArray elements: wrap each as StableRef handle
-                appendLine("    val _writeLen = minOf($listExpr.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = StableRef.create($listExpr[i]).asCPointer().toLong()")
-                appendLine("    return $listExpr.size")
-            }
-            is KneType.LIST, is KneType.SET, is KneType.MAP -> {
-                // Nested collection: wrap each inner collection as StableRef handle
-                appendLine("    val _writeLen = minOf($listExpr.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = StableRef.create($listExpr[i] as Any).asCPointer().toLong()")
-                appendLine("    return $listExpr.size")
-            }
-            else -> {
-                appendLine("    val _writeLen = minOf($listExpr.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = $listExpr[i]")
-                appendLine("    return $listExpr.size")
-            }
+    private fun StringBuilder.appendCollectionElementsReturn(listExpr: String, elemType: KneType, overflowValue: String = listExpr) {
+        // Results that do not fit the caller buffer are parked for kne_takeOverflow (signalled by Int.MIN_VALUE)
+        if (elemType == KneType.STRING) {
+            appendLine("    val _encoded = $listExpr.map { it.encodeToByteArray() }")
+            appendLine("    if (_encoded.sumOf { it.size + 1 } > outBufLen) { _kneOverflow.value = $overflowValue; return Int.MIN_VALUE }")
+            appendLine("    var _offset = 0")
+            appendLine("    for (_bytes in _encoded) {")
+            appendLine("        _bytes.forEachIndexed { i, b -> outBuf?.set(_offset + i, b) }")
+            appendLine("        outBuf?.set(_offset + _bytes.size, 0)")
+            appendLine("        _offset += _bytes.size + 1")
+            appendLine("    }")
+            appendLine("    return $listExpr.size")
+            return
         }
+        appendLine("    if ($listExpr.size > outLen) { _kneOverflow.value = $overflowValue; return Int.MIN_VALUE }")
+        val writeExpr = when (elemType) {
+            KneType.BOOLEAN -> "if ($listExpr[i]) 1 else 0"
+            is KneType.ENUM -> "$listExpr[i].ordinal"
+            is KneType.OBJECT, KneType.BYTE_ARRAY -> "StableRef.create($listExpr[i]).asCPointer().toLong()"
+            is KneType.LIST, is KneType.SET, is KneType.MAP -> "StableRef.create($listExpr[i] as Any).asCPointer().toLong()"
+            else -> "$listExpr[i]"
+        }
+        appendLine("    for (i in $listExpr.indices) outBuf!![i] = $writeExpr")
+        appendLine("    return $listExpr.size")
     }
 
     private fun StringBuilder.appendMapReturn(type: KneType.MAP) {
         appendLine("    val _keys = _result.keys.toList()")
         appendLine("    val _values = _result.values.toList()")
-        appendLine("    val _writeLen = minOf(_result.size, outLen)")
+        val keyFits = if (type.keyType == KneType.STRING) "_keys.sumOf { it.encodeToByteArray().size + 1 } <= outKeysLen" else "true"
+        val valFits = if (type.valueType == KneType.STRING) "_values.sumOf { it.encodeToByteArray().size + 1 } <= outValuesLen" else "true"
+        appendLine("    if (_result.size > outLen || !($keyFits) || !($valFits)) { _kneOverflow.value = _result; return Int.MIN_VALUE }")
+        appendLine("    val _writeLen = _result.size")
         // Write keys
         appendMapArrayWrite("_keys", type.keyType, "outKeys", if (type.keyType == KneType.STRING) "outKeysLen" else null)
         // Write values
@@ -1252,23 +1318,23 @@ class NativeBridgeGenerator {
         }.joinToString(", ")
 
         if (fnType.returnType == KneType.UNIT) {
-            appendLine("        _fnPtr.invoke($invokeArgs)")
+            appendLine("        _kneCallback { _fnPtr.invoke($invokeArgs) }")
         } else if (fnType.returnType == KneType.BYTE_ARRAY) {
             // Callback returns ByteArray as packed buffer: [size:Int32][pad:4][data...]
-            appendLine("        val _retPtr = _fnPtr.invoke($invokeArgs)!!")
+            appendLine("        val _retPtr = _kneCallback { _fnPtr.invoke($invokeArgs) }!!")
             appendLine("        val _baSize = _retPtr.reinterpret<IntVar>().pointed.value")
             appendLine("        ByteArray(_baSize) { (_retPtr + 8 + it)!!.pointed.value }")
         } else if (fnType.returnType == KneType.BOOLEAN) {
-            appendLine("        _fnPtr.invoke($invokeArgs) != 0")
+            appendLine("        _kneCallback { _fnPtr.invoke($invokeArgs) } != 0")
         } else if (fnType.returnType == KneType.STRING) {
-            appendLine("        _fnPtr.invoke($invokeArgs)?.toKString() ?: \"\"")
+            appendLine("        _kneCallback { _fnPtr.invoke($invokeArgs) }?.toKString() ?: \"\"")
         } else if (fnType.returnType is KneType.ENUM) {
-            appendLine("        ${fnType.returnType.fqName}.entries[_fnPtr.invoke($invokeArgs)]")
+            appendLine("        ${fnType.returnType.fqName}.entries[_kneCallback { _fnPtr.invoke($invokeArgs) }]")
         } else if (fnType.returnType is KneType.OBJECT) {
-            appendLine("        _fnPtr.invoke($invokeArgs).toCPointer<COpaque>()!!.asStableRef<${fnType.returnType.fqName}>().get()")
+            appendLine("        _kneCallback { _fnPtr.invoke($invokeArgs) }.toCPointer<COpaque>()!!.asStableRef<${fnType.returnType.fqName}>().get()")
         } else if (fnType.returnType is KneType.DATA_CLASS) {
             val dc = fnType.returnType as KneType.DATA_CLASS
-            appendLine("        val _retPtr = _fnPtr.invoke($invokeArgs)!!")
+            appendLine("        val _retPtr = _kneCallback { _fnPtr.invoke($invokeArgs) }!!")
             var offset = 0
             val fieldArgs = dc.fields.joinToString(", ") { f ->
                 val expr = when (f.type) {
@@ -1287,16 +1353,16 @@ class NativeBridgeGenerator {
             appendLine("        ${dc.fqName}($fieldArgs)")
         } else if (fnType.returnType is KneType.LIST || fnType.returnType is KneType.SET) {
             val elemType = when (fnType.returnType) { is KneType.LIST -> fnType.returnType.elementType; is KneType.SET -> (fnType.returnType as KneType.SET).elementType; else -> KneType.INT }
-            appendLine("        val _retPtr = _fnPtr.invoke($invokeArgs)!!")
+            appendLine("        val _retPtr = _kneCallback { _fnPtr.invoke($invokeArgs) }!!")
             appendLine("        val _count = _retPtr.reinterpret<IntVar>().pointed.value")
             appendCollectionReturnFromPackedBuffer(elemType, fnType.returnType is KneType.SET)
         } else if (fnType.returnType is KneType.MAP) {
             val mapType = fnType.returnType as KneType.MAP
-            appendLine("        val _retPtr = _fnPtr.invoke($invokeArgs)!!")
+            appendLine("        val _retPtr = _kneCallback { _fnPtr.invoke($invokeArgs) }!!")
             appendLine("        val _count = _retPtr.reinterpret<IntVar>().pointed.value")
             appendMapReturnFromPackedBuffer(mapType)
         } else {
-            appendLine("        _fnPtr.invoke($invokeArgs)")
+            appendLine("        _kneCallback { _fnPtr.invoke($invokeArgs) }")
         }
         if (needsMemScoped) {
             appendLine("        }")
@@ -1477,6 +1543,7 @@ class NativeBridgeGenerator {
             KneType.STRING -> {
                 appendLine("    if (_result == null) return -1")
                 appendLine("    val bytes = _result.encodeToByteArray()")
+                appendLine("    if (bytes.size >= outLen) _kneOverflow.value = _result")
                 appendLine("    val writeLen = minOf(bytes.size, outLen - 1)")
                 appendLine("    bytes.forEachIndexed { i, b -> if (i < writeLen) outBuf?.set(i, b) }")
                 appendLine("    outBuf?.set(writeLen, 0)")
@@ -1528,6 +1595,7 @@ class NativeBridgeGenerator {
     private fun StringBuilder.appendStringReturn(expr: String) {
         appendLine("    val result = $expr")
         appendLine("    val bytes = result.encodeToByteArray()")
+        appendLine("    if (bytes.size >= outLen) _kneOverflow.value = result")
         appendLine("    val writeLen = minOf(bytes.size, outLen - 1)")
         appendLine("    bytes.forEachIndexed { i, b -> if (i < writeLen) outBuf?.set(i, b) }")
         appendLine("    outBuf?.set(writeLen, 0)")
@@ -1536,6 +1604,7 @@ class NativeBridgeGenerator {
 
     private fun StringBuilder.appendByteArrayReturn(expr: String) {
         appendLine("    val result = $expr")
+        appendLine("    if (result.size >= outLen) _kneOverflow.value = result")
         appendLine("    val writeLen = minOf(result.size, outLen)")
         appendLine("    result.forEachIndexed { i, b -> if (i < writeLen) outBuf?.set(i, b) }")
         appendLine("    return result.size")
@@ -1711,8 +1780,8 @@ class NativeBridgeGenerator {
     /** Collect all collection types used as suspend function return types. */
     private fun collectSuspendCollectionTypes(module: KneModule): Set<KneType> {
         val result = mutableSetOf<KneType>()
+        // Direct returns need readers too: results overflowing the caller buffer are read back by handle
         fun scan(fn: KneFunction) {
-            if (!fn.isSuspend) return
             val rt = when (val t = fn.returnType) {
                 is KneType.NULLABLE -> t.inner
                 else -> t
@@ -1973,168 +2042,92 @@ class NativeBridgeGenerator {
         }
     }
 
-    /** Generate a single suspend collection reader bridge for a given element key. */
-    private fun StringBuilder.appendSuspendCollReaderForKey(prefix: String, key: String) {
-        val symbolName = "${prefix}_kne_suspend_readColl$key"
-        when (key) {
-            "String" -> {
-                appendLine("@CName(\"$symbolName\")")
-                appendLine("fun `$symbolName`(handle: Long, outBuf: CPointer<ByteVar>?, outBufLen: Int): Int {")
-                appendLine("    val _coll = handle.toCPointer<COpaque>()!!.asStableRef<Any>().get()")
-                appendLine("    val _list = when (_coll) { is List<*> -> _coll; is Set<*> -> _coll.toList(); else -> emptyList() }")
-                appendLine("    var _offset = 0")
-                appendLine("    for (_s in _list) {")
-                appendLine("        val _bytes = (_s as String).encodeToByteArray()")
-                appendLine("        if (_offset + _bytes.size + 1 > outBufLen) break")
-                appendLine("        _bytes.forEachIndexed { i, b -> outBuf?.set(_offset + i, b) }")
-                appendLine("        outBuf?.set(_offset + _bytes.size, 0)")
-                appendLine("        _offset += _bytes.size + 1")
-                appendLine("    }")
-                appendLine("    handle.toCPointer<COpaque>()!!.asStableRef<Any>().dispose()")
-                appendLine("    return _list.size")
-                appendLine("}")
-                appendLine()
-            }
-            "ObjHandle" -> {
-                appendLine("@CName(\"$symbolName\")")
-                appendLine("fun `$symbolName`(handle: Long, outBuf: CPointer<LongVar>?, outLen: Int): Int {")
-                appendLine("    val _coll = handle.toCPointer<COpaque>()!!.asStableRef<Any>().get()")
-                appendLine("    val _list = when (_coll) { is List<*> -> _coll; is Set<*> -> _coll.toList(); else -> emptyList() }")
-                appendLine("    val _writeLen = minOf(_list.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = StableRef.create(_list[i]!!).asCPointer().toLong()")
-                appendLine("    handle.toCPointer<COpaque>()!!.asStableRef<Any>().dispose()")
-                appendLine("    return _list.size")
-                appendLine("}")
-                appendLine()
-            }
-            "ByteArray" -> {
-                // Each ByteArray element wrapped as StableRef handle (Long)
-                appendLine("@CName(\"$symbolName\")")
-                appendLine("fun `$symbolName`(handle: Long, outBuf: CPointer<LongVar>?, outLen: Int): Int {")
-                appendLine("    val _coll = handle.toCPointer<COpaque>()!!.asStableRef<Any>().get()")
-                appendLine("    val _list = when (_coll) { is List<*> -> _coll; is Set<*> -> _coll.toList(); else -> emptyList() }")
-                appendLine("    val _writeLen = minOf(_list.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = StableRef.create(_list[i] as ByteArray).asCPointer().toLong()")
-                appendLine("    handle.toCPointer<COpaque>()!!.asStableRef<Any>().dispose()")
-                appendLine("    return _list.size")
-                appendLine("}")
-                appendLine()
-            }
-            "NestedColl" -> {
-                // Each nested collection element wrapped as StableRef handle (Long)
-                appendLine("@CName(\"$symbolName\")")
-                appendLine("fun `$symbolName`(handle: Long, outBuf: CPointer<LongVar>?, outLen: Int): Int {")
-                appendLine("    val _coll = handle.toCPointer<COpaque>()!!.asStableRef<Any>().get()")
-                appendLine("    val _list = when (_coll) { is List<*> -> _coll; is Set<*> -> _coll.toList(); else -> emptyList() }")
-                appendLine("    val _writeLen = minOf(_list.size, outLen)")
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = StableRef.create(_list[i] as Any).asCPointer().toLong()")
-                appendLine("    handle.toCPointer<COpaque>()!!.asStableRef<Any>().dispose()")
-                appendLine("    return _list.size")
-                appendLine("}")
-                appendLine()
-            }
-            else -> {
-                // Int, Long, Double, Float, Short, Byte, Boolean, Enum — all use the same pattern
-                val nativeType = when (key) {
-                    "Long" -> "LongVar"
-                    "Double" -> "DoubleVar"
-                    "Float" -> "FloatVar"
-                    else -> "IntVar" // Int, Short, Byte, Boolean, Enum
-                }
-                appendLine("@CName(\"$symbolName\")")
-                appendLine("fun `$symbolName`(handle: Long, outBuf: CPointer<$nativeType>?, outLen: Int): Int {")
-                appendLine("    val _coll = handle.toCPointer<COpaque>()!!.asStableRef<Any>().get()")
-                appendLine("    val _list = when (_coll) { is List<*> -> _coll; is Set<*> -> _coll.toList(); else -> emptyList() }")
-                appendLine("    val _writeLen = minOf(_list.size, outLen)")
-                val writeExpr = when (key) {
-                    "Boolean" -> "if (_list[i] as Boolean) 1 else 0"
-                    "Enum" -> "(_list[i] as Enum<*>).ordinal"
-                    "Short" -> "(_list[i] as Short).toInt()"
-                    "Byte" -> "(_list[i] as Byte).toInt()"
-                    "Long" -> "_list[i] as Long"
-                    "Double" -> "_list[i] as Double"
-                    "Float" -> "_list[i] as Float"
-                    else -> "_list[i] as Int"
-                }
-                appendLine("    for (i in 0 until _writeLen) outBuf!![i] = $writeExpr")
-                appendLine("    handle.toCPointer<COpaque>()!!.asStableRef<Any>().dispose()")
-                appendLine("    return _list.size")
-                appendLine("}")
-                appendLine()
-            }
+    /** Native element var type written by handle readers for a collection element key. */
+    private fun readerVarType(key: String): String = when (key) {
+        "Long", "ObjHandle", "ByteArray", "NestedColl" -> "LongVar"
+        "Double" -> "DoubleVar"
+        "Float" -> "FloatVar"
+        "Short" -> "ShortVar"
+        "Byte" -> "ByteVar"
+        else -> "IntVar" // Int, Boolean, Enum
+    }
+
+    /** Expression encoding element [expr] (typed Any?) for a collection element key. */
+    private fun readerWriteExpr(key: String, expr: String): String = when (key) {
+        "Boolean" -> "if ($expr as Boolean) 1 else 0"
+        "Enum" -> "($expr as Enum<*>).ordinal"
+        "Short" -> "$expr as Short"
+        "Byte" -> "$expr as Byte"
+        "Long" -> "$expr as Long"
+        "Double" -> "$expr as Double"
+        "Float" -> "$expr as Float"
+        "ObjHandle", "ByteArray", "NestedColl" -> "StableRef.create($expr!!).asCPointer().toLong()"
+        else -> "$expr as Int"
+    }
+
+    /**
+     * Emits code writing [listExpr] into [buf] of capacity [cap] (bytes for strings, elements otherwise).
+     * When it does not fit, returns `-required` without consuming anything so that the caller can retry.
+     */
+    private fun StringBuilder.appendReaderWrite(key: String, listExpr: String, buf: String, cap: String, tag: String) {
+        if (key == "String") {
+            appendLine("    val _enc$tag = $listExpr.map { (it as String).encodeToByteArray() }")
+            appendLine("    val _req$tag = _enc$tag.sumOf { it.size + 1 }")
+            appendLine("    if (_req$tag > $cap) return -_req$tag")
+        } else {
+            appendLine("    if ($listExpr.size > $cap) return -$listExpr.size")
         }
     }
 
-    /** Generate a suspend map reader bridge for a given (keyKey, valueKey) combination. */
+    private fun StringBuilder.appendReaderFill(key: String, listExpr: String, buf: String, tag: String) {
+        if (key == "String") {
+            appendLine("    var _off$tag = 0")
+            appendLine("    for (_b in _enc$tag) {")
+            appendLine("        _b.forEachIndexed { i, b -> $buf!![_off$tag + i] = b }")
+            appendLine("        $buf!![_off$tag + _b.size] = 0")
+            appendLine("        _off$tag += _b.size + 1")
+            appendLine("    }")
+        } else {
+            appendLine("    for (i in $listExpr.indices) $buf!![i] = ${readerWriteExpr(key, "$listExpr[i]")}")
+        }
+    }
+
+    /** Generate a single collection reader bridge (reads a StableRef'd List/Set) for a given element key. */
+    private fun StringBuilder.appendSuspendCollReaderForKey(prefix: String, key: String) {
+        val symbolName = "${prefix}_kne_suspend_readColl$key"
+        val bufType = if (key == "String") "ByteVar" else readerVarType(key)
+        appendLine("@CName(\"$symbolName\")")
+        appendLine("fun `$symbolName`(handle: Long, outBuf: CPointer<$bufType>?, outLen: Int): Int {")
+        appendLine("    val _ref = handle.toCPointer<COpaque>()!!.asStableRef<Any>()")
+        appendLine("    val _list = when (val _coll = _ref.get()) { is List<*> -> _coll; is Set<*> -> _coll.toList(); else -> emptyList() }")
+        appendReaderWrite(key, "_list", "outBuf", "outLen", "")
+        appendReaderFill(key, "_list", "outBuf", "")
+        appendLine("    _ref.dispose()")
+        appendLine("    return _list.size")
+        appendLine("}")
+        appendLine()
+    }
+
+    /** Generate a map reader bridge (reads a StableRef'd Map) for a given (keyKey, valueKey) combination. */
     private fun StringBuilder.appendSuspendMapReader(prefix: String, keyKey: String, valKey: String) {
         val symbolName = "${prefix}_kne_suspend_readMap${keyKey}${valKey}"
-
-        // Determine native pointer types for keys and values
-        val keyNativeType = if (keyKey == "String") "ByteVar" else "IntVar"
-        val valNativeType = when (valKey) {
-            "String" -> "ByteVar"
-            "Long" -> "LongVar"
-            "Double" -> "DoubleVar"
-            "Float" -> "FloatVar"
-            else -> "IntVar"
-        }
-
-        val keyParamStr = if (keyKey == "String") {
-            "outKeys: CPointer<ByteVar>?, outKeysLen: Int"
-        } else {
-            "outKeys: CPointer<$keyNativeType>?, outKeysMaxLen: Int"
-        }
-        val valParamStr = if (valKey == "String") {
-            "outVals: CPointer<ByteVar>?, outValsLen: Int"
-        } else {
-            "outVals: CPointer<$valNativeType>?, outValsMaxLen: Int"
-        }
-
+        val keyBufType = if (keyKey == "String") "ByteVar" else readerVarType(keyKey)
+        val valBufType = if (valKey == "String") "ByteVar" else readerVarType(valKey)
         appendLine("@CName(\"$symbolName\")")
-        appendLine("fun `$symbolName`(handle: Long, $keyParamStr, $valParamStr): Int {")
-        appendLine("    val _map = handle.toCPointer<COpaque>()!!.asStableRef<Any>().get() as Map<*, *>")
+        appendLine("fun `$symbolName`(handle: Long, outKeys: CPointer<$keyBufType>?, outKeysLen: Int, outVals: CPointer<$valBufType>?, outValsLen: Int): Int {")
+        appendLine("    val _ref = handle.toCPointer<COpaque>()!!.asStableRef<Any>()")
+        appendLine("    val _map = _ref.get() as Map<*, *>")
         appendLine("    val _keys = _map.keys.toList()")
         appendLine("    val _vals = _map.values.toList()")
-
-        // Write keys
-        if (keyKey == "String") {
-            appendLine("    var _kOff = 0")
-            appendLine("    for (_k in _keys) {")
-            appendLine("        val _bytes = (_k as String).encodeToByteArray()")
-            appendLine("        if (_kOff + _bytes.size + 1 > outKeysLen) break")
-            appendLine("        _bytes.forEachIndexed { i, b -> outKeys?.set(_kOff + i, b) }")
-            appendLine("        outKeys?.set(_kOff + _bytes.size, 0)")
-            appendLine("        _kOff += _bytes.size + 1")
-            appendLine("    }")
-        } else {
-            appendLine("    val _kWriteLen = minOf(_keys.size, outKeysMaxLen)")
-            appendLine("    for (i in 0 until _kWriteLen) outKeys!![i] = _keys[i] as Int")
-        }
-
-        // Write values
-        if (valKey == "String") {
-            appendLine("    var _vOff = 0")
-            appendLine("    for (_v in _vals) {")
-            appendLine("        val _bytes = (_v as String).encodeToByteArray()")
-            appendLine("        if (_vOff + _bytes.size + 1 > outValsLen) break")
-            appendLine("        _bytes.forEachIndexed { i, b -> outVals?.set(_vOff + i, b) }")
-            appendLine("        outVals?.set(_vOff + _bytes.size, 0)")
-            appendLine("        _vOff += _bytes.size + 1")
-            appendLine("    }")
-        } else {
-            val valWriteExpr = when (valKey) {
-                "Long" -> "_vals[i] as Long"
-                "Double" -> "_vals[i] as Double"
-                "Float" -> "_vals[i] as Float"
-                "Enum" -> "(_vals[i] as Enum<*>).ordinal"
-                "Boolean" -> "if (_vals[i] as Boolean) 1 else 0"
-                else -> "_vals[i] as Int"
-            }
-            appendLine("    val _vWriteLen = minOf(_vals.size, outValsMaxLen)")
-            appendLine("    for (i in 0 until _vWriteLen) outVals!![i] = $valWriteExpr")
-        }
-
-        appendLine("    handle.toCPointer<COpaque>()!!.asStableRef<Any>().dispose()")
+        // Capacity checks never return early with partial writes: compute both requirements first
+        appendLine("    val _kReq = ${if (keyKey == "String") "_keys.sumOf { (it as String).encodeToByteArray().size + 1 }" else "_keys.size"}")
+        appendLine("    val _vReq = ${if (valKey == "String") "_vals.sumOf { (it as String).encodeToByteArray().size + 1 }" else "_vals.size"}")
+        appendLine("    if (_kReq > outKeysLen || _vReq > outValsLen) return -maxOf(_kReq, _vReq)")
+        if (keyKey == "String") appendLine("    val _encK = _keys.map { (it as String).encodeToByteArray() }")
+        if (valKey == "String") appendLine("    val _encV = _vals.map { (it as String).encodeToByteArray() }")
+        appendReaderFill(keyKey, "_keys", "outKeys", "K")
+        appendReaderFill(valKey, "_vals", "outVals", "V")
+        appendLine("    _ref.dispose()")
         appendLine("    return _map.size")
         appendLine("}")
         appendLine()
@@ -2143,51 +2136,37 @@ class NativeBridgeGenerator {
     // ── Suspend function support ────────────────────────────────────────────
 
     /** Generate module-level helper bridges for suspend functions. */
-    private fun StringBuilder.appendSuspendHelpers(prefix: String) {
+    private fun StringBuilder.appendSuspendHelpers(prefix: String, hasFlow: Boolean) {
         // Cancel a native Job from JVM
         appendLine("@CName(\"${prefix}_kne_cancelJob\")")
         appendLine("fun `${prefix}_kne_cancelJob`(jobHandle: Long) {")
         appendLine("    if (jobHandle == 0L) return")
-        appendLine("    try { jobHandle.toCPointer<COpaque>()!!.asStableRef<Job>().get().cancel() } catch (_: Throwable) {}")
+        if (hasFlow) {
+            appendLine("    when (val target = jobHandle.toCPointer<COpaque>()!!.asStableRef<Any>().get()) {")
+            appendLine("        is Job -> target.cancel()")
+            appendLine("        is KneFlowJob -> target.job.cancel()")
+            appendLine("    }")
+        } else {
+            appendLine("    jobHandle.toCPointer<COpaque>()!!.asStableRef<Job>().get().cancel()")
+        }
         appendLine("}")
         appendLine()
+        if (hasFlow) {
+            appendLine("@CName(\"${prefix}_kne_flowCredit\")")
+            appendLine("fun `${prefix}_kne_flowCredit`(jobHandle: Long) {")
+            appendLine("    if (jobHandle == 0L) return")
+            appendLine("    jobHandle.toCPointer<COpaque>()!!.asStableRef<KneFlowJob>().get().credits.trySend(Unit)")
+            appendLine("}")
+            appendLine()
+        }
 
-        // Dispose a StableRef (for cleaning up result handles)
-        appendLine("@CName(\"${prefix}_kne_disposeRef\")")
-        appendLine("fun `${prefix}_kne_disposeRef`(handle: Long) {")
-        appendLine("    if (handle == 0L) return")
-        appendLine("    try { handle.toCPointer<COpaque>()?.asStableRef<Any>()?.dispose() } catch (_: Throwable) {}")
-        appendLine("}")
-        appendLine()
-
-        // Read a String from a StableRef handle
-        appendLine("@CName(\"${prefix}_kne_readStringRef\")")
-        appendLine("fun `${prefix}_kne_readStringRef`(handle: Long, outBuf: CPointer<ByteVar>?, outLen: Int): Int {")
-        appendLine("    val str = handle.toCPointer<COpaque>()!!.asStableRef<String>().get()")
-        appendLine("    val bytes = str.encodeToByteArray()")
-        appendLine("    val writeLen = minOf(bytes.size, outLen - 1)")
-        appendLine("    bytes.forEachIndexed { i, b -> if (i < writeLen) outBuf?.set(i, b) }")
-        appendLine("    outBuf?.set(writeLen, 0)")
-        appendLine("    return bytes.size")
-        appendLine("}")
-        appendLine()
-
-        // Read a ByteArray from a StableRef handle
-        appendLine("@CName(\"${prefix}_kne_readByteArrayRef\")")
-        appendLine("fun `${prefix}_kne_readByteArrayRef`(handle: Long, outBuf: CPointer<ByteVar>?, outLen: Int): Int {")
-        appendLine("    val bytes = handle.toCPointer<COpaque>()!!.asStableRef<ByteArray>().get()")
-        appendLine("    val writeLen = minOf(bytes.size, outLen)")
-        appendLine("    bytes.forEachIndexed { i, b -> if (i < writeLen) outBuf?.set(i, b) }")
-        appendLine("    return bytes.size")
-        appendLine("}")
-        appendLine()
     }
 
     /** Generate a suspend function bridge (instance method). */
     private fun StringBuilder.appendSuspendMethod(fn: KneFunction, cls: KneClass, prefix: String) {
         val symbolName = "${prefix}_${cls.simpleName}_${fn.name}"
         val paramList = buildExpandedParamList(fn.params)
-        val allParams = "handle: Long${if (paramList.isNotEmpty()) ", $paramList" else ""}, _contPtr: Long, _excPtr: Long, _cancelOut: CPointer<LongVar>?"
+        val allParams = "handle: Long${if (paramList.isNotEmpty()) ", $paramList" else ""}, _contPtr: Long, _excPtr: Long, _callId: Long, _cancelOut: CPointer<LongVar>?"
 
         appendLine("@CName(\"$symbolName\")")
         appendLine("fun `$symbolName`($allParams) {")
@@ -2197,35 +2176,34 @@ class NativeBridgeGenerator {
         appendObjectParamConversions(fn)
         val callArgs = fn.params.joinToString(", ") { p -> buildCallArg(p.name, p.type) }
 
-        // Create Job for cancellation
+        // Create Job for cancellation; the JVM side owns (and disposes) the StableRef
         appendLine("    val _job = Job()")
-        appendLine("    val _jobRef = StableRef.create(_job)")
-        appendLine("    _cancelOut?.pointed?.value = _jobRef.asCPointer().toLong()")
+        appendLine("    _cancelOut?.pointed?.value = StableRef.create(_job).asCPointer().toLong()")
 
-        // Launch coroutine
-        appendLine("    CoroutineScope(_job + Dispatchers.Default).launch {")
+        // ATOMIC: the body always runs, so exactly one completion stub fires even if cancelled before start
+        appendLine("    CoroutineScope(_job + Dispatchers.Default).launch(start = CoroutineStart.ATOMIC) {")
         appendLine("        try {")
 
         // Call suspend function and encode result
         if (fn.returnType == KneType.UNIT) {
             appendLine("            obj.${fn.name}($callArgs)")
-            appendLine("            val _contFn = _contPtr.toCPointer<CFunction<(Int, Long) -> Unit>>()!!")
+            appendLine("            val _contRaw = _contPtr.toCPointer<CFunction<(Long, Int, Long) -> Unit>>()!!")
+            appendLine("            val _contFn = { hasValue: Int, value: Long -> _contRaw.invoke(_callId, hasValue, value) }")
             appendLine("            _contFn.invoke(1, 0L)")
         } else {
             appendLine("            val _result = obj.${fn.name}($callArgs)")
-            appendLine("            val _contFn = _contPtr.toCPointer<CFunction<(Int, Long) -> Unit>>()!!")
+            appendLine("            val _contRaw = _contPtr.toCPointer<CFunction<(Long, Int, Long) -> Unit>>()!!")
+            appendLine("            val _contFn = { hasValue: Int, value: Long -> _contRaw.invoke(_callId, hasValue, value) }")
             appendSuspendResultEncode("_result", fn.returnType)
         }
 
         appendLine("        } catch (_e: CancellationException) {")
-        appendLine("            val _excFn = _excPtr.toCPointer<CFunction<(Long) -> Unit>>()!!")
+        appendLine("            val _excFn = { msg: Long -> _excPtr.toCPointer<CFunction<(Long, Long) -> Unit>>()!!.invoke(_callId, msg) }")
         appendLine("            _excFn.invoke(0L)")
         appendLine("        } catch (_e: Throwable) {")
-        appendLine("            val _excFn = _excPtr.toCPointer<CFunction<(Long) -> Unit>>()!!")
+        appendLine("            val _excFn = { msg: Long -> _excPtr.toCPointer<CFunction<(Long, Long) -> Unit>>()!!.invoke(_callId, msg) }")
         appendLine("            val _msgRef = StableRef.create(_e.message ?: _e::class.simpleName ?: \"Unknown error\")")
         appendLine("            _excFn.invoke(_msgRef.asCPointer().toLong())")
-        appendLine("        } finally {")
-        appendLine("            _jobRef.dispose()")
         appendLine("        }")
         appendLine("    }")
         appendLine("}")
@@ -2290,7 +2268,7 @@ class NativeBridgeGenerator {
         val flowType = fn.returnType as KneType.FLOW
         val elemType = flowType.elementType
         val paramList = buildExpandedParamList(fn.params)
-        val allParams = "handle: Long${if (paramList.isNotEmpty()) ", $paramList" else ""}, _nextPtr: Long, _errorPtr: Long, _completePtr: Long, _cancelOut: CPointer<LongVar>?"
+        val allParams = "handle: Long${if (paramList.isNotEmpty()) ", $paramList" else ""}, _nextPtr: Long, _errorPtr: Long, _completePtr: Long, _callId: Long, _cancelOut: CPointer<LongVar>?"
 
         appendLine("@CName(\"$symbolName\")")
         appendLine("fun `$symbolName`($allParams) {")
@@ -2299,27 +2277,29 @@ class NativeBridgeGenerator {
         appendObjectParamConversions(fn)
         val callArgs = fn.params.joinToString(", ") { p -> buildCallArg(p.name, p.type) }
 
+        // The JVM side owns (and disposes) the StableRef; credits bound the number of undelivered elements
         appendLine("    val _job = Job()")
-        appendLine("    val _jobRef = StableRef.create(_job)")
-        appendLine("    _cancelOut?.pointed?.value = _jobRef.asCPointer().toLong()")
+        appendLine("    val _credits = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.UNLIMITED)")
+        appendLine("    repeat($FLOW_INITIAL_CREDITS) { _credits.trySend(Unit) }")
+        appendLine("    _cancelOut?.pointed?.value = StableRef.create(KneFlowJob(_job, _credits)).asCPointer().toLong()")
 
-        appendLine("    CoroutineScope(_job + Dispatchers.Default).launch {")
+        appendLine("    CoroutineScope(_job + Dispatchers.Default).launch(start = CoroutineStart.ATOMIC) {")
         appendLine("        try {")
         appendLine("            val _flow = obj.${fn.name}($callArgs)")
         appendLine("            _flow.collect { _value ->")
-        appendLine("                val _nextFn = _nextPtr.toCPointer<CFunction<(Long) -> Unit>>()!!")
+        appendLine("                _credits.receive()")
+        appendLine("                val _nextFn = { value: Long -> _nextPtr.toCPointer<CFunction<(Long, Long) -> Unit>>()!!.invoke(_callId, value) }")
         appendFlowElementEncode("_value", elemType)
         appendLine("            }")
-        appendLine("            val _completeFn = _completePtr.toCPointer<CFunction<() -> Unit>>()!!")
+        appendLine("            val _completeFn = { _completePtr.toCPointer<CFunction<(Long) -> Unit>>()!!.invoke(_callId) }")
         appendLine("            _completeFn.invoke()")
         appendLine("        } catch (_e: CancellationException) {")
-        appendLine("            // silently cancelled — JVM side already knows")
+        appendLine("            // Terminal signal with no message: lets the JVM side release its resources")
+        appendLine("            _errorPtr.toCPointer<CFunction<(Long, Long) -> Unit>>()!!.invoke(_callId, 0L)")
         appendLine("        } catch (_e: Throwable) {")
-        appendLine("            val _errorFn = _errorPtr.toCPointer<CFunction<(Long) -> Unit>>()!!")
+        appendLine("            val _errorFn = { msg: Long -> _errorPtr.toCPointer<CFunction<(Long, Long) -> Unit>>()!!.invoke(_callId, msg) }")
         appendLine("            val _msgRef = StableRef.create(_e.message ?: _e::class.simpleName ?: \"Unknown error\")")
         appendLine("            _errorFn.invoke(_msgRef.asCPointer().toLong())")
-        appendLine("        } finally {")
-        appendLine("            _jobRef.dispose()")
         appendLine("        }")
         appendLine("    }")
         appendLine("}")
