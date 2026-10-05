@@ -952,6 +952,111 @@ class Calculator(initial: Int = 0) {
 
     fun getNullableMapByLabel(): Map<String, String>? = if (label.isEmpty()) null else mapOf("label" to label)
 
+    // ── Value types with bodies (verbatim on JVM) ───────────────────────────
+
+    fun evaluate(op: BinaryOp, value: Int): Int {
+        accumulator = op.apply(accumulator, value)
+        return accumulator
+    }
+
+    fun lastBinaryOp(): BinaryOp = if (accumulator >= 0) BinaryOp.PLUS else BinaryOp.MINUS
+
+    fun toVector(): Vector = Vector(accumulator, accumulator * 2)
+
+    fun addVector(v: Vector): Vector = Vector(accumulator, accumulator) + v
+
+    fun vectorLengthSquared(v: Vector): Int = v.lengthSquared
+
+    fun findBinaryOp(symbol: String): BinaryOp? = BinaryOp.fromSymbol(symbol)
+
+    fun vectorOrNull(present: Boolean): Vector? = if (present) toVector() else null
+
+    fun vectorsUpTo(count: Int): List<Vector> = List(count) { Vector(it, -it) }
+
+    fun binaryOpsCycle(count: Int): List<BinaryOp> = List(count) { BinaryOp.entries[it % BinaryOp.entries.size] }
+
+    fun buildVector(factory: (Int) -> Vector): Vector = factory(accumulator)
+
+    fun measureVector(fn: (Vector) -> Int): Int {
+        accumulator = fn(toVector())
+        return accumulator
+    }
+
+    fun pickBinaryOp(chooser: (Int) -> BinaryOp): BinaryOp = chooser(accumulator)
+
+    suspend fun delayedVector(delayMs: Long): Vector {
+        kotlinx.coroutines.delay(delayMs)
+        return toVector()
+    }
+
+    suspend fun delayedEvaluate(op: BinaryOp, value: Int, delayMs: Long): Int {
+        kotlinx.coroutines.delay(delayMs)
+        return evaluate(op, value)
+    }
+
+    // ── Runtime torture helpers ─────────────────────────────────────────────
+
+    fun bigInts(count: Int): List<Int> = List(count) { it }
+
+    fun bigLongs(count: Int): List<Long> = List(count) { it.toLong() * 1_000_000_007L }
+
+    fun bigIntSet(count: Int): Set<Int> = (0 until count).toSet()
+
+    fun bigStrings(count: Int, length: Int): List<String> = List(count) { i -> "s$i-" + "x".repeat(length) }
+
+    fun bigMap(count: Int): Map<String, Int> = (0 until count).associate { "key_$it" to it }
+
+    fun bigString(length: Int): String = "é".repeat(length)
+
+    fun echoInts(items: List<Int>): List<Int> = items
+
+    fun echoStrings(items: List<String>): List<String> = items
+
+    fun sumInts(items: List<Int>): Long = items.sumOf { it.toLong() }
+
+    fun bigTaggedList(count: Int): TaggedList = TaggedList("big", List(count) { it })
+
+    suspend fun delayedBigInts(count: Int): List<Int> {
+        kotlinx.coroutines.delay(1)
+        return List(count) { it }
+    }
+
+    suspend fun delayedBigStrings(count: Int): List<String> {
+        kotlinx.coroutines.delay(1)
+        return List(count) { "item_$it" }
+    }
+
+    fun fastFlow(count: Int): kotlinx.coroutines.flow.Flow<Int> = kotlinx.coroutines.flow.flow {
+        repeat(count) { emit(it) }
+    }
+
+    fun callTwice(fn: (Int) -> Int): Int = fn(1) + fn(2)
+
+    fun bigNamedValue(length: Int): NamedValue = NamedValue("n".repeat(length), length)
+
+    fun bigNamedValues(count: Int, length: Int): List<NamedValue> = List(count) { NamedValue("v$it-" + "x".repeat(length), it) }
+
+    fun bigPayload(size: Int): BinaryPayload = BinaryPayload("p".repeat(size), ByteArray(size) { (it % 251).toByte() })
+
+    fun bigNullableString(length: Int): String? = if (length < 0) null else "ü".repeat(length)
+
+    fun bigIndexed(count: Int): Map<Int, String> = (0 until count).associateWith { "v$it" }
+
+    fun longKeyMap(count: Int): Map<Long, Int> = (0 until count).associate { it.toLong() * 3_000_000_000L to it }
+
+    fun enumKeyMap(): Map<Operation, Int> = Operation.entries.associateWith { it.ordinal * 10 }
+
+    fun shortList(count: Int): List<Short> = List(count) { (it - 30_000).toShort() }
+
+    fun byteList(count: Int): List<Byte> = List(count) { (it - 128).toByte() }
+
+    suspend fun delayedShorts(count: Int): List<Short> {
+        kotlinx.coroutines.delay(1)
+        return shortList(count)
+    }
+
+    fun echoBytes(data: ByteArray): ByteArray = data
+
     // ── Companion object ────────────────────────────────────────────────────
 
     companion object {

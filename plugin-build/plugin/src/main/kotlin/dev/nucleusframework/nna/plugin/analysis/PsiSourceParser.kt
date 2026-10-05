@@ -10,6 +10,7 @@ import dev.nucleusframework.nna.plugin.ir.KneInterface
 import dev.nucleusframework.nna.plugin.ir.KneModule
 import dev.nucleusframework.nna.plugin.ir.KneParam
 import dev.nucleusframework.nna.plugin.ir.KneProperty
+import dev.nucleusframework.nna.plugin.ir.KneSourceDecl
 import dev.nucleusframework.nna.plugin.ir.KneType
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreApplicationEnvironment
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreApplicationEnvironmentMode
@@ -135,17 +136,27 @@ class PsiSourceParser {
                 val ktFile = psiFactory.createFile(file.name, file.readText())
                 val pkg = ktFile.packageFqName.asString()
                 if (pkg.isNotEmpty()) packages.add(pkg)
+                val imports = ktFile.importDirectives.map { it.text }
 
                 fun processDeclarations(declarations: List<KtDeclaration>, parentSimpleName: String?, isTopLevel: Boolean) {
                     for (decl in declarations) {
                         if (decl.isPrivateOrInternal()) continue
                         when {
-                            decl is KtClass && decl.isEnum() -> parseEnum(decl, pkg, typeMaps)?.let { enumMap.putIfAbsent(it.fqName, it) }
+                            decl is KtClass && decl.isEnum() -> parseEnum(decl, pkg, typeMaps)
+                                ?.copy(source = sourceDecl(decl, imports))
+                                ?.let { enumMap.putIfAbsent(it.fqName, it) }
                             decl is KtClass && decl.isData() -> {
                                 val name = decl.name ?: continue
                                 val dcInfo = knownDataClasses[name] ?: continue
                                 val fq = dcInfo.first
-                                dataClassMap.putIfAbsent(fq, KneDataClass(name, fq, dcInfo.second, isCommon = name in commonDataClassNames))
+                                dataClassMap.putIfAbsent(
+                                    fq,
+                                    KneDataClass(
+                                        name, fq, dcInfo.second,
+                                        isCommon = name in commonDataClassNames,
+                                        source = sourceDecl(decl, imports),
+                                    ),
+                                )
                             }
                             decl is KtClass && decl.isInterface() -> {
                                 val iface = parseInterface(decl, pkg, typeMaps, isCommon = isCommonFile) ?: continue
@@ -215,6 +226,13 @@ class PsiSourceParser {
             fields.add(KneParam(name, type))
         }
         return if (fields.isNotEmpty()) fields else null
+    }
+
+    /** Captures the declaration text (incl. KDoc and annotations) re-indented to top level. */
+    private fun sourceDecl(decl: KtClass, imports: List<String>): KneSourceDecl {
+        val indent = decl.prevSibling?.text?.substringAfterLast('\n', missingDelimiterValue = "")?.takeIf { it.isBlank() }.orEmpty()
+        val text = (indent + decl.text).trimIndent()
+        return KneSourceDecl(text, imports)
     }
 
     private fun parseClass(ktClass: KtClass, pkg: String, typeMaps: TypeMaps, isCommon: Boolean = false): KneClass? {

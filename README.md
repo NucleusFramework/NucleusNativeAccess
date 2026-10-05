@@ -150,8 +150,8 @@ Every test compiles Kotlin/Native → `libcalculator.so` (470+ exported symbols)
 | `Set<T>?` | &mdash; | ✅ 5t | &mdash; | &mdash; | &mdash; | -1 count = null sentinel |
 | `Map<K, V>` | ✅ 12t | ✅ 12t | &mdash; | ✅ 2t | ✅ 2t | String→Int, Int→String, Int→Int, String→String + merge/empty |
 | `Map<K, V>?` | &mdash; | ✅ 4t | &mdash; | &mdash; | &mdash; | -1 count = null sentinel |
-| `(T) -> R` (lambda) | ✅ 15t | &mdash; | &mdash; | &mdash; | &mdash; | persistent `Arena.ofShared()` |
-| `Flow<T>` | &mdash; | ✅ 50t+ | &mdash; | &mdash; | &mdash; | `channelFlow` + 3 callbacks (onNext, onError, onComplete), incl. `Flow<DataClass>` |
+| `(T) -> R` (lambda) | ✅ 15t | &mdash; | &mdash; | &mdash; | &mdash; | per-call upcall arena, exceptions propagate with their original type |
+| `Flow<T>` | &mdash; | ✅ 50t+ | &mdash; | &mdash; | &mdash; | static onNext/onError/onComplete stubs + credit-based backpressure, incl. `Flow<DataClass>` |
 
 ### Declarations
 
@@ -174,9 +174,9 @@ Every test compiles Kotlin/Native → `libcalculator.so` (470+ exported symbols)
 | Data classes (nativeMain) | ✅ | auto-generates JVM data class + field marshalling |
 | Data classes (commonMain) | ✅ | reuses existing JVM type, no proxy generated |
 | Suspend functions | ✅ | `suspendCancellableCoroutine` + bidirectional cancellation (110+ tests) |
-| Flow&lt;T&gt; return | ✅ | `channelFlow` + onNext/onError/onComplete callbacks (50+ tests) |
-| Exception propagation | ✅ | `try/catch` wrapping, `KotlinNativeException` on JVM |
-| Object lifecycle | ✅ | `Cleaner` for GC + `close()` for explicit release |
+| Flow&lt;T&gt; return | ✅ | onNext/onError/onComplete callbacks with backpressure, no element dropped (50+ tests) |
+| Exception propagation | ✅ | `try/catch` wrapping, `KotlinNativeException` on JVM (thread-local, safe under concurrency) |
+| Object lifecycle | ✅ | `Cleaner` for GC + `close()` for explicit release; calls after `close()` throw `IllegalStateException` |
 
 ### Suspend functions
 
@@ -193,7 +193,7 @@ suspend fun fetchData(query: String): String {
 val result = calc.fetchData("test")  // suspends the coroutine
 ```
 
-**How it works**: the native bridge launches a `CoroutineScope` with a `Job`, passes continuation + exception callbacks as FFM upcall stubs. The JVM proxy uses `suspendCancellableCoroutine` to suspend until the native coroutine completes.
+**How it works**: the native bridge launches a `CoroutineScope` with a `Job` and reports completion through two static FFM upcall stubs, dispatched by a per-call id. The JVM proxy uses `suspendCancellableCoroutine` to suspend until the native coroutine completes.
 
 **Cancellation**: JVM coroutine cancel → `Job.cancel()` on native side. Native `CancellationException` → JVM `CancellationException`. Bidirectional, automatic.
 
@@ -215,7 +215,7 @@ calc.countUp(100).toList()               // [1, 2, ..., 100]
 calc.infiniteFlow().take(3).toList()     // [0, 1, 2] — auto-cancelled
 ```
 
-**How it works**: 3 native callbacks (`onNext`, `onError`, `onComplete`) are passed as FFM upcall stubs. The native side collects the Flow in a `CoroutineScope` and calls `onNext` for each element. The JVM proxy uses `channelFlow { trySend(...); awaitClose { cancelJob() } }`.
+**How it works**: 3 static FFM upcall stubs (`onNext`, `onError`, `onComplete`) are dispatched by a per-call id. The native side collects the Flow in a `CoroutineScope` and only emits against credits granted as the JVM collector consumes elements, so a slow collector applies backpressure instead of losing elements.
 
 **Cancellation**: collecting only N elements (via `take`, `first`) automatically cancels the native Flow collection. Manual `Job.cancel()` also propagates.
 
@@ -241,7 +241,9 @@ desktop.memoryFlow(2000L).collect { info ->
 
 JVM lambdas cross the FFM boundary via upcall stubs. The plugin generates all the FFM infrastructure automatically.
 
-**Lifecycle**: each proxy object holds a persistent `Arena.ofShared()`. Upcall stubs live as long as the object &mdash; async callbacks (event handlers, listeners) work out of the box. The arena is freed on `close()` or GC.
+**Lifecycle**: upcall stubs are allocated in a per-call arena and released when the call returns, so a callback is valid **for the duration of the call only** (as with JNI). Native code must not store a callback and invoke it later; expose event streams as `Flow<T>` instead.
+
+**Exceptions**: an exception thrown by a JVM callback unwinds the native caller and is rethrown on the JVM with its original type and message.
 
 **Supported callback signatures**:
 - Params: `Int`, `Long`, `Double`, `Float`, `Boolean`, `Byte`, `Short`, `String`, `enum class`, `data class`
@@ -260,13 +262,15 @@ calc.onValueChanged { value -> println("Value: $value") }
 calc.transform { it * 2 }
 calc.formatWith { "Result: $it" }
 
-// Async callbacks work (e.g. native event listeners)
-desktop.setTrayClickCallback { index -> println("Clicked: $index") }
+// Event streams: use Flow rather than stored callbacks
+desktop.trayClicks().collect { index -> println("Clicked: $index") }
 ```
 
 ### Collections
 
 `List<T>`, `Set<T>`, and `Map<K, V>` cross the FFM boundary using flat arrays (pointer + size), inspired by swift-java's `[UInt8]` lowering.
+
+There is no size limit: results that do not fit the initial transfer buffers (4096 elements / 8 KB of packed strings) are parked natively and read back with a larger buffer, without calling the function twice. The same applies to large `String`, `ByteArray` and data class `String` fields.
 
 **Supported element types**: `Int`, `Long`, `Double`, `Float`, `Short`, `Byte`, `Boolean`, `String`, `enum class`
 
@@ -293,6 +297,8 @@ val meta = calc.getMetadata()              // {current=42, scale=3}
 ### Data classes
 
 Data classes are marshalled **by value** (field decomposition) &mdash; each field becomes a separate C ABI argument. Supported field types: all primitives + `String`.
+
+The JVM data class (and `enum class`) is a verbatim copy of the native declaration: default values, body members, companion objects, KDoc and annotations are preserved. Imports of native-only packages (`kotlinx.cinterop`, `platform.*`, `kotlin.native`) are dropped, so bodies must only use APIs available on the JVM.
 
 ```kotlin
 // Can be in commonMain or nativeMain
@@ -407,6 +413,8 @@ Measured on Intel Core i5-14600 (20 cores), 45 GB RAM, Ubuntu 25.10, JDK 25 (Gra
 |---------|--------|-------------|
 | Private/internal/protected members | Only public API is exported | Use `public` modifier |
 | Expect/actual declarations | KMP's responsibility | Use platform-specific source sets |
+| Storing a JVM callback on the native side | Upcall stubs are released when the call returns | Expose events as `Flow<T>` |
+| NUL characters in `String` arguments | Native strings are NUL-terminated; rejected with `IllegalArgumentException` | Encode the data (e.g. `ByteArray`) |
 | `ByteArray` in collections | Buffer lifecycle complexity across FFM | Use `List<Int>` or Base64 String |
 | `ByteArray` as data class field | Out-param buffer not wired for DC fields | Use separate method or String |
 | `ByteArray` as callback param | Buffer lifecycle across callback boundary | Use String (Base64) |

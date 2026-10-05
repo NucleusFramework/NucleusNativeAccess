@@ -17,6 +17,16 @@ data class KneDataClass(
     val fqName: String,
     val fields: List<KneParam>,
     val isCommon: Boolean = false,
+    val source: KneSourceDecl? = null,
+) : Serializable
+
+/**
+ * Verbatim source of a value-type declaration (enum / data class), copied as-is to the JVM side
+ * so that the JVM variant matches the native one (body members, defaults, KDoc, annotations).
+ */
+data class KneSourceDecl(
+    val text: String,
+    val imports: List<String> = emptyList(),
 ) : Serializable
 
 data class KneInterface(
@@ -55,6 +65,7 @@ data class KneEnum(
     val fqName: String,
     val entries: List<KneEnumEntry>,
     val constructorParams: List<KneParam> = emptyList(),
+    val source: KneSourceDecl? = null,
 ) : Serializable
 
 data class KneConstructor(
