@@ -2,8 +2,9 @@ import io.github.kdroidfilter.nucleus.desktop.application.dsl.TargetFormat
 
 plugins {
     kotlin("multiplatform")
-    id("org.jetbrains.compose") version "1.10.2"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.3.20"
+    id("org.jetbrains.compose") version "1.12.1"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.4.20"
+    id("org.jetbrains.compose.hot-reload") version "1.3.0-beta01"
     id("io.github.kdroidfilter.nucleus") version "1.7.2"
     id("dev.nucleusframework.nna")
 }
@@ -41,13 +42,13 @@ kotlin {
     // cinterop with libnotify (real Linux native notifications via D-Bus)
     if (hostOs == "Linux") {
         nativeTarget.compilations["main"].cinterops {
-            val libnotify by creating {
+            create("libnotify") {
                 defFile(project.file("src/nativeInterop/cinterop/libnotify.def"))
             }
-            val systray by creating {
+            create("systray") {
                 defFile(project.file("src/nativeInterop/cinterop/systray.def"))
             }
-            val gio by creating {
+            create("gio") {
                 defFile(project.file("src/nativeInterop/cinterop/gio.def"))
             }
 
@@ -57,7 +58,7 @@ kotlin {
     // cinterop with Win32 Shell API (tray icon + toast notifications)
     if (hostOs.startsWith("Windows")) {
         nativeTarget.compilations["main"].cinterops {
-            val wintray by creating {
+            create("wintray") {
                 defFile(project.file("src/nativeInterop/cinterop/wintray.def"))
             }
         }
@@ -66,15 +67,15 @@ kotlin {
     jvm()
 
     sourceSets {
-        val jvmMain by getting {
+        jvmMain {
             dependencies {
                 implementation(compose.desktop.currentOs)
-                implementation(compose.runtime)
+                implementation("org.jetbrains.compose.runtime:runtime:1.12.1")
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
                 implementation("io.github.kdroidfilter:nucleus.graalvm-runtime:1.7.2")
             }
         }
-        val jvmTest by getting {
+        jvmTest {
             dependencies {
                 implementation(kotlin("test"))
             }

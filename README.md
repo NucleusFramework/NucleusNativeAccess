@@ -45,7 +45,7 @@ pluginManagement {
 ```kotlin
 // build.gradle.kts
 plugins {
-    kotlin("multiplatform") version "2.3.20"
+    kotlin("multiplatform") version "2.4.20"
     id("dev.nucleusframework.nna") version "0.1.0"
 }
 ```
@@ -63,7 +63,7 @@ kotlin {
     jvm()
 
     sourceSets {
-        val jvmMain by getting {
+        jvmMain {
             dependencies {
                 // your JVM dependencies (Compose, Ktor, etc.)
             }
@@ -341,7 +341,7 @@ calc.add(5) // works normally after exception
 
 ## Benchmarks — Native (FFM) vs Pure JVM
 
-Measured on Intel Core i5-14600 (20 cores), 45 GB RAM, Ubuntu 25.10, JDK 25 (GraalVM), Kotlin 2.3.20.
+Measured on Intel Core i5-14600 (20 cores), 45 GB RAM, Ubuntu 25.10, JDK 25 (GraalVM), Kotlin 2.4.20.
 
 **Methodology**: each benchmark runs the operation in a tight loop. 3 warmup iterations are discarded, then 5 measured iterations are averaged. "Native" creates a proxy object via FFM and calls into the Kotlin/Native shared library (.so). "JVM" runs the equivalent Kotlin/JVM code directly. Ratio = native/jvm (>1 = native slower due to FFM overhead). Memory is measured via `Runtime.totalMemory() - freeMemory()` before/after with explicit GC.
 
@@ -488,7 +488,7 @@ my-app/
 
 ```kotlin
 plugins {
-    kotlin("multiplatform") version "2.3.20"
+    kotlin("multiplatform") version "2.4.20"
     id("dev.nucleusframework.nna")
 }
 
@@ -508,9 +508,9 @@ kotlinNativeExport {
 
 ```kotlin
 plugins {
-    kotlin("multiplatform") version "2.3.20"
-    id("org.jetbrains.compose") version "1.10.2"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.3.20"
+    kotlin("multiplatform") version "2.4.20"
+    id("org.jetbrains.compose") version "1.12.1"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.4.20"
     id("io.github.kdroidfilter.nucleus") version "1.7.2"
 }
 
@@ -519,7 +519,7 @@ kotlin {
     jvm()
 
     sourceSets {
-        val jvmMain by getting {
+        jvmMain {
             dependencies {
                 implementation(compose.desktop.currentOs)
                 implementation(project(":native"))
@@ -544,7 +544,7 @@ You can combine the plugin with Kotlin/Native cinterop to wrap native C librarie
 // build.gradle.kts
 kotlin {
     linuxX64().compilations["main"].cinterops {
-        val libnotify by creating {
+        create("libnotify") {
             defFile(project.file("src/nativeInterop/cinterop/libnotify.def"))
         }
     }
@@ -632,7 +632,7 @@ Data classes are supported as value types (field marshalling), and `commonMain` 
 
 ## Requirements
 
-- **Kotlin** 2.3.20+
+- **Kotlin** 2.4.20+
 - **Gradle** 9.1+ (for JDK 25 support)
 - **JDK** 22+ (FFM stable since JDK 22 / JEP 454), recommended 25
 - **Kotlin/Native** toolchain (bundled with KMP plugin)

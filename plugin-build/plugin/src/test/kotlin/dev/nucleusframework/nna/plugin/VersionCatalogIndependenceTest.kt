@@ -31,7 +31,7 @@ class VersionCatalogIndependenceTest {
         writeConsumerProject(
             catalogToml = """
                 [versions]
-                kotlin = "2.3.20"
+                kotlin = "2.4.20"
 
                 [libraries]
                 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
@@ -48,7 +48,7 @@ class VersionCatalogIndependenceTest {
         writeConsumerProject(
             catalogToml = """
                 [versions]
-                kotlin = "2.3.20"
+                kotlin = "2.4.20"
 
                 [libraries]
                 kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.10.2" }
@@ -89,7 +89,7 @@ class VersionCatalogIndependenceTest {
         File(root, "build.gradle.kts").writeText(
             """
             plugins {
-                kotlin("multiplatform") version "2.3.20"
+                kotlin("multiplatform") version "2.4.20"
                 id("dev.nucleusframework.nna")
             }
 

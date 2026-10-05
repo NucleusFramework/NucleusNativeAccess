@@ -152,7 +152,7 @@ class InterfaceTest {
 
     @Test fun `Scale - does not implement Printable`() {
         Scale(10.0).use { scale ->
-            assertFalse(scale is Printable)
+            assertFalse(Printable::class.isInstance(scale))
         }
     }
 
@@ -440,7 +440,7 @@ class InterfaceTest {
                     assertTrue(ruler is Measurable)
                     assertTrue(ruler is Printable)
                     assertTrue(scale is Measurable)
-                    assertFalse(scale is Printable)
+                    assertFalse(Printable::class.isInstance(scale))
                 }
             }
         }
