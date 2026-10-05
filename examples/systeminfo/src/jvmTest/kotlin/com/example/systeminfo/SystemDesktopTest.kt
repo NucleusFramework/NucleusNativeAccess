@@ -55,13 +55,16 @@ class SystemDesktopTest {
     }
 
     @Test
-    fun `capture screen is not empty and starts with BM`() {
+    fun `capture screen is a non-empty BMP or PNG image`() {
         SystemDesktop().use { desktop ->
             kotlinx.coroutines.runBlocking {
                 val screen = desktop.captureScreen()
                 assertTrue(screen.isNotEmpty())
-                assertTrue(screen[0] == 'B'.toByte())
-                assertTrue(screen[1] == 'M'.toByte())
+                // Linux/Windows encode BMP ("BM"), macOS encodes PNG (0x89 "PNG")
+                val isBmp = screen[0] == 'B'.code.toByte() && screen[1] == 'M'.code.toByte()
+                val isPng = screen.size >= 4 && screen[0] == 0x89.toByte() &&
+                    screen[1] == 'P'.code.toByte() && screen[2] == 'N'.code.toByte() && screen[3] == 'G'.code.toByte()
+                assertTrue(isBmp || isPng, "unexpected image header: ${screen.take(4)}")
             }
         }
     }
