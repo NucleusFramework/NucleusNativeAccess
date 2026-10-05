@@ -63,6 +63,7 @@ class KotlinNativeExportPlugin : Plugin<Project> {
         val nativeBridgesDir = project.layout.buildDirectory.dir("generated/kne/nativeBridges")
         val jvmProxiesDir = project.layout.buildDirectory.dir("generated/kne/jvmProxies")
         val jvmResourcesDir = project.layout.buildDirectory.dir("generated/kne/jvmResources")
+        val incrementalCacheDir = project.layout.buildDirectory.dir("kne/incremental")
 
         // Detect the first native target and its source sets.
         // Convention: use src/nativeMain if it exists (shared native source set),
@@ -119,6 +120,7 @@ class KotlinNativeExportPlugin : Plugin<Project> {
             taskOutputDir.set(nativeBridgesDir)
             taskJvmOutputDir.set(jvmProxiesDir)
             taskJvmResourcesDir.set(jvmResourcesDir)
+            taskCacheDir.set(incrementalCacheDir)
             taskPsiClasspath.from(psiClasspath)
         }
         // Keep old task name as alias

@@ -464,10 +464,11 @@ The generated `KneRuntime` uses a three-tier loading strategy:
 
 ### Build performance & Gradle Cache
 
-Currently, the bridge generation task is marked as `@DisableCachingByDefault` because the Kotlin PSI source analysis is not yet fully cacheable.
+`generateKneNativeBridges` is a `@CacheableTask` and works incrementally between executions:
 
-- **Status**: The plugin performs a full re-scan and code generation on every build if sources change.
-- **Future work**: Implement proper Gradle build caching and incremental compilation by mapping source files to specific IR outputs, allowing faster builds for large projects.
+- **Build cache**: outputs depend only on relative source paths/contents, the PSI classpath and the extension configuration, so they are restored `FROM-CACHE` across checkouts and machines (enable with `org.gradle.caching=true`). Sources are merged in a deterministic order, so the generated code is reproducible.
+- **Source file → IR mapping**: each source file maps to a cached prescan (its type declarations) and IR fragment, kept in `build/kne/incremental` (Gradle local state). A file is re-parsed only if its content changed, or if a symbol it looked up now resolves differently (e.g. a referenced data class gained a field). The PSI environment is not even started when nothing needs parsing.
+- **IR → outputs mapping**: when the merged API is unchanged (e.g. only function bodies were edited), code generation is skipped. Otherwise only generated files whose content changed are rewritten and stale ones are deleted, so the downstream incremental Kotlin compilation only recompiles what actually changed.
 
 ### GraalVM native-image support
 
@@ -617,11 +618,14 @@ plugin-build/plugin/src/main/kotlin/dev/nucleusframework/nna/plugin/
 ├── ir/                          # Intermediate representation (inspired by SirModule)
 │   └── KneIR.kt                 # KneModule, KneClass, KneFunction, KneType...
 ├── analysis/
-│   ├── PsiSourceParser.kt       # Kotlin PSI-based source parser (kotlin-compiler-embeddable)
+│   ├── PsiSourceParser.kt       # Kotlin PSI-based source parser (kotlin-compiler-embeddable), incremental per file
+│   ├── SymbolTable.kt           # PSI-free symbol table + type resolution with lookup tracking
+│   ├── ParseCache.kt            # Persistent source file → IR / IR → outputs cache
 │   └── PsiParseWorkAction.kt    # Gradle Worker for isolated PSI classloader
 ├── codegen/
 │   ├── NativeBridgeGenerator.kt # @CName + StableRef bridges (inspired by @_cdecl thunks)
-│   └── FfmProxyGenerator.kt     # JVM proxy classes with FFM (inspired by FFMSwift2JavaGenerator)
+│   ├── FfmProxyGenerator.kt     # JVM proxy classes with FFM (inspired by FFMSwift2JavaGenerator)
+│   └── GeneratedOutputs.kt      # Write-if-changed output sync + stale file removal
 ├── tasks/
 │   └── GenerateNativeBridgesTask.kt  # Single task: PSI parse + native bridges + JVM proxies + GraalVM metadata
 ├── KotlinNativeExportExtension.kt
